@@ -1,3 +1,5 @@
+import json
+import pprint
 import numpy as np
 from PIL import Image
 from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections
@@ -14,11 +16,15 @@ class Embeddings:
         self.model = AutoModel.from_pretrained(model_ckpt)
         self.threshold = 0.99
 
+        # a flag to keep state of embeddings collection in memory
+        self.loaded = False
+
         # init db (milvus)
         connections.connect("default", host=host, port=port)
 
         # define schema for the embeddings collection
         embedding_fields = [
+            FieldSchema(name="primary_id", dtype=DataType.INT64, is_primary=True, auto_id=True),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=768),
             FieldSchema(name="user_id", dtype=DataType.INT64),
             FieldSchema(name="message_id", dtype=DataType.INT64),
@@ -27,16 +33,52 @@ class Embeddings:
         embedding_schema = CollectionSchema(embedding_fields, "Image embeddings with metadata")
         self.embeddings_collection = Collection("embeddings", schema=embedding_schema)
 
-        # define schema for the bas studnets leaderboard collection
+        # index embedding vector
+        if not self.embeddings_collection.has_index(index_name="idx_embeddings"):
+            index_params = {
+                "index_type": "IVF_FLAT",
+                "metric_type": "IP",
+                "params": {"nlist": 100}
+            }
+            self.embeddings_collection.create_index("embedding", index_params, index_name="idx_embeddings")
+
+        # define schema for the bad studnets leaderboard collection
         leaderboard_fields = [
             FieldSchema(name="user_id", dtype=DataType.INT64, is_primary=True),
-            FieldSchema(name="duplicate_count", dtype=DataType.INT64)
+            FieldSchema(name="duplicate_count", dtype=DataType.INT64),
+            FieldSchema(name="dummy_vector", dtype=DataType.FLOAT_VECTOR, dim=1)
         ]
         leaderboard_schema = CollectionSchema(leaderboard_fields, "User leaderboard")
         self.leaderboard_collection = Collection("bad_students", schema=leaderboard_schema)
+        if not self.leaderboard_collection.has_index(index_name="idx_dummy"):
+            index_params = {
+                "index_type": "IVF_FLAT",
+                "metric_type": "L2",
+                "params": {"nlist": 1}
+            }
+            self.leaderboard_collection.create_index("dummy_vector", index_params, index_name="idx_dummy")
 
 
-    def process_picture(self, image_path, user_id, message_id, datetime):
+    def process_picture(self, image_path, user_id, message_id, datetime, keep_loaded=False, manual_flush=False):
+        if not self.loaded:
+            self.embeddings_collection.load()
+            self.loaded = True
+            print("Loaded collection to memory")
+
+        r_user_id, r_message_id = self._process_picture(image_path, user_id, message_id, datetime, False) 
+
+        if not keep_loaded:
+            self.unload_db()
+
+        return r_user_id, r_message_id
+    
+    def unload_db(self):
+        self.embeddings_collection.release()
+        self.loaded = False
+        print("Unloaded collection from memory")
+
+
+    def _process_picture(self, image_path, user_id, message_id, datetime, manual_flush):
         """
         This function processes a new image and checks if it's a duplicate
         If image is not a duplicate, it will be added to the database
@@ -46,9 +88,13 @@ class Embeddings:
             int, int: user_id and target_message_id. if target message is -1 - the image was not a duplicate
         """
         new_embedding = self.get_image_embedding(image_path)
+        print(image_path)
         
+        duplicate_found = False
+        target_message_id = -1
+    
         # query db
-        search_params = {"metric_type": "IP", "params": {"nprobe": 10}}
+        search_params = {"metric_type": "IP", "params": {"nprobe": 100}}
         results = self.embeddings_collection.search(
             [new_embedding],
             "embedding",
@@ -57,22 +103,21 @@ class Embeddings:
             output_fields=["message_id"]
         )
 
-        # process results
-        duplicate_found = False
-        target_message_id = -1
-        for i, result in enumerate(results[0]):
-            similarity = 1 - result.distances[i]
-            if similarity > self.threshold:
-                target_message_id = result.entity.get('message_id')
-                duplicate_found = True
-                print(f"Duplicate found with similarity: {similarity} matching message_id: {target_message_id}")
-                self.update_leaderboard(user_id)
-                break
+        for result in results:
+            for i, distance in enumerate(result.distances):
+                if distance > self.threshold:
+                    message_id = result[i].entity.get('message_id')
+                    print(f"Duplicate found with similarity: {distance}")
+                    print(f"Matching message_id: {message_id}")
+                    self.update_leaderboard(user_id)
+                    duplicate_found = True
+                    break
                 
         if not duplicate_found:
-            self.insert_embedding(new_embedding, user_id, message_id, datetime)
+            self.insert_embedding(new_embedding, user_id, message_id, datetime, manual_flush)
         
         return user_id, target_message_id
+    
 
     def get_image_embedding(self, image_path):
         """Process a single image and return its embedding."""
@@ -86,7 +131,8 @@ class Embeddings:
         
         return image_features.cpu().numpy().flatten()  # Flatten to 1D array
     
-    def insert_embedding(self, embedding, user_id, message_id, datetime):
+    
+    def insert_embedding(self, embedding, user_id, message_id, datetime, manual_flush=False):
         """Insert an embedding and its metadata into the embeddings collection."""
         entities = [
             [embedding],
@@ -95,10 +141,13 @@ class Embeddings:
             [datetime]
         ]
         self.embeddings_collection.insert(entities)
-        self.embeddings_collection.flush()
+        if manual_flush:
+            self.embeddings_collection.flush()
+
         
     def update_leaderboard(self, user_id):
         """Update the leaderboard: increment duplicate count for the user, or add them with count 1 if not present."""
+        self.leaderboard_collection.load()
         results = self.leaderboard_collection.query(
             expr=f"user_id == {user_id}",
             output_fields=["user_id", "duplicate_count"]
@@ -108,19 +157,25 @@ class Embeddings:
         if results:
             entities = [
                 [user_id],
-                [results[0]['duplicate_count'] + 1]
+                [results[0]['duplicate_count'] + 1],
+                [[0.0]]
             ]
         else:
             entities = [
                 [user_id],
-                [1]
+                [1],
+                [[0.0]]
             ]
         
         self.leaderboard_collection.insert(entities)
         self.leaderboard_collection.flush()
+        self.leaderboard_collection.release()
+
 
     def get_leaderboard(self):
         """Retrieve the leaderboard sorted by duplicate count."""
+        self.leaderboard_collection.load()
         results = self.leaderboard_collection.query(expr="duplicate_count > 0", output_fields=["user_id", "duplicate_count"])
         sorted_leaderboard = sorted(results, key=lambda x: x["duplicate_count"], reverse=True)
+        self.leaderboard_collection.release()
         return sorted_leaderboard
