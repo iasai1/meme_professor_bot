@@ -20,6 +20,7 @@ parts/
 sdist/
 var/
 volumes/
+_volumes/
 wheels/
 share/python-wheels/
 *.egg-info/
